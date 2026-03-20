@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.env
+dataset/pretrain_hq.jsonl
+dataset/sft_mini_512.jsonl
