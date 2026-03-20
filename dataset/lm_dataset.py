@@ -97,6 +97,7 @@ class SFTDataset(Dataset):
 
                 # AI的回答+结束标记都恢复成原本的label
                 for j in range(start, min(end+len(self.eos_id), len(input_ids))):
+                    # 不用遮的地方
                     labels[j] = input_ids[j]
                 # 跳到结束标志后再开始或结束
                 i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
@@ -109,7 +110,7 @@ class SFTDataset(Dataset):
         sample = self.samples[index]
         # 是否随机插入system_prompt
         conversations = pre_processing_chat(sample['conversations'])
-        # 把对话转换成文本
+        # 1.把对话转换成文本
         prompt = self.create_chat_prompt(conversations)
 
         # 清空think块
@@ -118,7 +119,7 @@ class SFTDataset(Dataset):
         input_ids = self.tokenizer(prompt).input_ids[:self.max_length]
         input_ids += [self.tokenizer.pad_token_id]*(self.max_length-len(input_ids))
 
-        # 遮羞布，生成标签
+        # 2.遮羞布，生成标签
         labels = self.generate_labels(input_ids)
 
         return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
