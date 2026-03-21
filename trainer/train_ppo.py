@@ -99,31 +99,30 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
     with torch.no_grad():
         reward_model_scores = []
         for prompt, response in zip(prompts, responses):
+            # 恢复对话格式
             pattern = r"<\|im_start\|>(system|user|assistant)\s+(.*?)<\|im_end\|>"
             matches = re.findall(pattern, prompt, re.DOTALL)
-            messages = [
-                {"role": role, "content": content.strip()} for role, content in matches
-            ]
+            messages = [{"role": role, "content": content.strip()} for role, content in matches]
 
+            # 将模型刚刚生成的response拼接到历史对话后面
+            # 这里的response包括<think>和<answer>，所以当作是过程分数
             tmp_chat = messages + [{"role": "assistant", "content": response}]
-            score = reward_model.get_score(
-                reward_tokenizer, tmp_chat
-            )  # ！修正：原get_reward(tmp_chat, reward_tokenizer)方法名和参数顺序错误
-
+            score = reward_model.get_score(reward_tokenizer, tmp_chat) # 调用外部小模型打分
+            # 将分数限制再[-3, 3]之间
             scale = 3.0
             score = max(min(score, scale), -scale)
 
-            if args.reasoning == 1:
+            if args.reasoning == 1: # 思考模式
                 answer_match = re.search(r"<answer>(.*?)</answer>", response, re.DOTALL)
                 if answer_match:
                     answer_content = answer_match.group(1).strip()
-                    # 对answer内容单独计算reward
-                    tmp_chat = messages + [
-                        {"role": "assistant", "content": answer_content}
-                    ]
+                    tmp_chat = messages + [{"role": "assistant", "content": answer_content}]
+
+                    # 仅仅对answer内容单独计算reward，所以是只看结论的分数
                     answer_score = reward_model.get_score(reward_tokenizer, tmp_chat)
                     answer_score = max(min(answer_score, scale), -scale)
-                    # 加权组合
+                    
+                    # 过程重要但结果更重要，强监督
                     score = score * 0.4 + answer_score * 0.6
             reward_model_scores.append(score)
 
@@ -192,43 +191,42 @@ def ppo_train_epoch(
             prompts, responses_text, reward_model, reward_tokenizer
         )
 
-        # 创建一个mask，用于标记哪些位置上是有效token
+        # 找到学列中哪些是真实词，哪些是用来补充长度的pad
         full_mask = (gen_out != tokenizer.pad_token_id).long()
-        # critic模型进行价值估计
+        # 教练给每个词打分
         value_seq = critic_model(input_ids=gen_out, attention_mask=full_mask)
-        # 拿到最后一个非pad位置的索引
+        # 由于句子长短不一，找到每句结束的那个词位置
         last_indices = full_mask.sum(dim=1) - 1
-        # 获取每条序列最后token的value
+        # 简化PPO，只取最后一个词作为这句话的分数
         values = value_seq[torch.arange(len(last_indices)), last_indices]
-        # advantage=reward-估计的value
+        # advantage=reward-critic
         advantages = rewards - values.detach()  # [B]
 
-        # 计算actor log，表示actor对这个答案的“信心”
-        # 先生成logits
+
+        # 先生成logits，表示模型对每个位置下一个词的预测结果
         logits = actor_model(
             input_ids=gen_out, attention_mask=full_mask
         ).logits  # [B, L, V]
-        # label是生成的token序列，去掉第一个token（因为logits是预测下一个token的概率）
+        # 错位对其，因为第一个字预测的是第二个字，所以label要去掉第一个字
         labels = gen_out[:, 1:].clone()
-        # 使用log_softmax计算log概率
+        # 转换成log概率
         logp_tokens = (
             F.log_softmax(logits[:, :-1, :], dim=-1)
-            .gather(2, labels.unsqueeze(-1))
+            .gather(2, labels.unsqueeze(-1)) # 挑出概率最大的那个
             .squeeze(-1)
         )  # [B, L-1]
+        # 得到每个问题的回答里每个字的log概率
         seq_len = gen_out.size(1) - 1
-        # 只关心response部分的概率，所以要把prompts部分的mask掉
-        resp_mask = torch.arange(seq_len, device=gen_out.device).unsqueeze(
-            0
-        ) >= prompt_lengths.unsqueeze(1)
-
+        # 把除了模型回答response的部分都遮住
+        resp_mask = torch.arange(seq_len, device=gen_out.device).unsqueeze(0) >= prompt_lengths.unsqueeze(1)
         final_mask = resp_mask & (~labels.eq(tokenizer.pad_token_id))
-        # 把所有response部分的log概率加起来，得到每条序列的总log概率
+        # 每个字的概率sum一起就是这句话的概率
         actor_logp = (logp_tokens * final_mask).sum(dim=1)
 
-        # 计算old和ref log的概率
         # old用于防止策略更新过大，ref用于计算KL惩罚，防止模型忘本
         with torch.no_grad():
+            # 不更新参数
+            # 上一轮的actor
             old_logits = old_actor_model(
                 input_ids=gen_out, attention_mask=full_mask
             ).logits  # [B, P+R, V]
@@ -239,6 +237,7 @@ def ppo_train_epoch(
             )  # [B, P+R-1]
             old_logp = (old_logp_tokens * final_mask).sum(dim=1)  # [B]
 
+            # reference模型
             ref_logits = ref_model(
                 input_ids=gen_out, attention_mask=full_mask
             ).logits  # [B, P+R, V]
@@ -248,23 +247,26 @@ def ppo_train_epoch(
                 .squeeze(-1)
             )  # [B, P+R-1]
             ref_logp = (ref_logp_tokens * final_mask).sum(dim=1)  # [B]
+            # 同样方式得到old_actor和reference两个模型生成回答的概率
 
-        # 计算KL散度和ratio
-        kl = (actor_logp - old_logp).mean()
-        kl_ref = (actor_logp - ref_logp).mean()
-        ratio = torch.exp(actor_logp - old_logp)  # [B]
+        # 计算KL散度(迈出的步子大小)和ratio
+        kl = (actor_logp - old_logp).mean() # 模型这一步迈出的步子
+        kl_ref = (actor_logp - ref_logp).mean() # 忘本
+        ratio = torch.exp(actor_logp - old_logp) # >1说明新模型更倾向于说这句话
 
         # PPO裁剪损失
-        surr1 = ratio * advantages  # [B]
+        # 原始增益，如果一句话拿了高分，就让说这句话的概率越大
+        surr1 = ratio * advantages
+        # 裁剪增益，只让ratio在[0.9-1.1]之间
         surr2 = (
             torch.clamp(ratio, 1.0 - args.clip_epsilon, 1.0 + args.clip_epsilon)
             * advantages
-        )  # [B]
-        policy_loss = -torch.min(surr1, surr2).mean()
+        )
+        policy_loss = -torch.min(surr1, surr2).mean() # 取最小值
 
-        # 价值函数损失
+        # 教练与实际打分之间的差距
         value_loss = F.mse_loss(values, rewards)
-        # 总损失
+        # 总损失 = 让acator说话更有水平 + 让教练打分更准 + 别忘本
         loss = policy_loss + args.vf_coef * value_loss + args.kl_coef * kl_ref  # scalar
         loss.backward()
 
@@ -279,7 +281,7 @@ def ppo_train_epoch(
             actor_optimizer.zero_grad()
             critic_optimizer.zero_grad()
 
-        # 📚 日志记录
+        # 日志记录
         if is_main_process() and (step % args.log_interval == 0 or step == iters):
             response_ids = gen_out[:, enc.input_ids.shape[1] :]
             is_eos = response_ids == tokenizer.eos_token_id
@@ -321,7 +323,7 @@ def ppo_train_epoch(
                 f"Avg Response Len: {avg_len_val:.2f}, Actor LR: {actor_lr:.2e}, Critic LR: {critic_lr:.2e}"
             )
 
-        # 📚 更新old actor
+        # 更新old actor
         if step % args.update_old_actor_freq == 0:
             state_dict = (
                 actor_model.module.state_dict()
@@ -333,7 +335,7 @@ def ppo_train_epoch(
             )
             old_actor_model.to(args.device)
 
-        # 📚 模型保存
+        # 模型保存
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             actor_model.eval()
             moe_suffix = "_moe" if lm_config.use_moe else ""
@@ -367,7 +369,7 @@ if __name__ == "__main__":
     """
     PPO主函数：近端策略优化脚本的入口点
     
-    📚 PPO训练架构：
+    PPO训练架构：
     1. Actor模型：生成策略，输出动作概率
     2. Critic模型：价值函数，估计状态价值
     3. Reward模型：奖励函数，评估生成质量
@@ -530,15 +532,15 @@ if __name__ == "__main__":
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # 📚 Old Actor模型（用于重要性采样）
+    # Old Actor模型（用于重要性采样）
     old_actor_model, _ = init_model(lm_config, base_weight, device=args.device)
     old_actor_model = old_actor_model.eval().requires_grad_(False)
 
-    # 📚 Reference模型（用于KL惩罚）
+    # Reference模型（用于KL惩罚）
     ref_model, _ = init_model(lm_config, base_weight, device=args.device)
     ref_model = ref_model.eval().requires_grad_(False)
 
-    # 📚 Critic模型（价值函数）
+    # Critic模型（价值函数）
     moe_suffix = "_moe" if lm_config.use_moe else ""
     ckp = f"{args.save_dir}/{base_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
     state_dict = torch.load(ckp, map_location=args.device)
@@ -546,7 +548,7 @@ if __name__ == "__main__":
     critic_model.load_state_dict(state_dict, strict=False)
     critic_model = critic_model.to(args.device)
 
-    # 📚 Reward模型（奖励函数）
+    # Reward模型（奖励函数）
     reward_model = AutoModel.from_pretrained(
         args.reward_model_path, torch_dtype=torch.float16, trust_remote_code=True
     )
