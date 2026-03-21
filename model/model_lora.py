@@ -12,7 +12,8 @@ class LoRA(nn.Module):
         self.B = nn.Linear(rank, out_features, bias=False)
 
         # AB矩阵都要训练，所以初始化权重
-        self.A.weight.data.normal_(mean=0,std=0.02) # 高斯初始化
+        # A高斯初始化
+        self.A.weight.data.normal_(mean=0,std=0.02)
         # B初始化为0的原因是，保证一开始的AB旁支跟没有是一样的
         self.B.weight.data.zero_()
 
@@ -70,7 +71,7 @@ def save_lora(model, path):
         if hasattr(module, "lora"):
             # 去掉前面module.这7个字符
             clean_name = name[7:] if name.startswith("module.") else name
-            # {name}.lora.lora_A: 权重A
+            # 保存为 {name}.lora.lora_A: 权重A
             lora_state = {
                 f"{clean_name}.lora.{k}": v for k, v in module.lora.state_dict().items()
             }
